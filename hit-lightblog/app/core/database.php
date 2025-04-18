@@ -1,54 +1,57 @@
 <?php
 namespace hitbugsreader\app\core;
-use DB;
+
 use Exception;
 use mysqli;
-use nested;
-use none;
-use query;
+use mysqli_stmt;
+use mysqli_result;
 
-class database extends \mysqli
+/**
+ * Benutzerdefinierte Exception-Klassen für besseres Exception-Handling
+ */
+class DatabaseException extends Exception {}
+class QueryException extends DatabaseException {}
+class ConnectionException extends DatabaseException {}
+
+/**
+ * Verbesserte Datenbankklasse mit Sicherheitsverbesserungen und Typensicherheit
+ */
+class Database extends mysqli
 {
+    private mysqli $link;
+    public static int $counter = 0;
+    private static ?Database $instance = null;
 
-    private $link = null;
-    public $filter;
-    static $inst = null;
-    public static $counter = 0;
-    private $_dbprefix = '';
-
-
-    public function log_db_errors($error, $query)
+    /**
+     * Konstruktor - erstellt eine neue Datenbankverbindung
+     *
+     * @param string $DB_HOST Hostname des Datenbankservers
+     * @param string $DB_USER Benutzername für die Datenbankverbindung
+     * @param string $DB_PASS Passwort für die Datenbankverbindung
+     * @param string $DB_NAME Name der Datenbank
+     * @throws ConnectionException Wenn die Verbindung nicht hergestellt werden kann
+     */
+    public function __construct(string $DB_HOST, string $DB_USER, string $DB_PASS, string $DB_NAME)
     {
-        $message = '<p>Error at ' . date('Y-m-d H:i:s') . ':</p>';
-        $message .= '<p>Query: ' . htmlentities($query) . '<br />';
-        $message .= 'Error: ' . $error;
-        $message .= '</p>';
-        if (defined('SEND_ERRORS_TO')) {
-            $headers = 'MIME-Version: 1.0' . "\r\n";
-            $headers .= 'Content-type: text/html; charset=iso-8859-1' . "\r\n";
-            $headers .= 'To: Admin <' . SEND_ERRORS_TO . '>' . "\r\n";
-            $headers .= 'From: Yoursite <system@' . $_SERVER['SERVER_NAME'] . '.com>' . "\r\n";
-            mail(SEND_ERRORS_TO, 'Database Error', $message, $headers);
-        } else {
-            trigger_error($message);
-        }
-        if (!defined('DISPLAY_DEBUG') || (defined('DISPLAY_DEBUG') && DISPLAY_DEBUG)) {
-            echo $message;
-        }
-    }
-
-
-    public function __construct($DB_HOST, $DB_USER, $DB_PASS, $DB_NAME)
-    {
-
         try {
             $this->link = new mysqli($DB_HOST, $DB_USER, $DB_PASS, $DB_NAME);
-       $this->link->set_charset("utf8");
+
+            if ($this->link->connect_error) {
+                throw new ConnectionException("Verbindung fehlgeschlagen: " . $this->link->connect_error);
+            }
+
+            // UTF8MB4 für volle Unicode-Unterstützung inkl. Emojis
+            $this->link->set_charset("utf8mb4");
         } catch (Exception $e) {
-            die('Unable to connect to database');
+            // Sicheres Logging des Fehlers
+            error_log("Datenbankverbindungsfehler: " . $e->getMessage());
+            throw new ConnectionException("Verbindung zur Datenbank konnte nicht hergestellt werden");
         }
     }
 
+    /**
+     * Destruktor - schließt die Datenbankverbindung
+     */
     public function __destruct()
     {
         if ($this->link) {
@@ -56,431 +59,810 @@ class database extends \mysqli
         }
     }
 
-    public function filter($data):mixed
+    /**
+     * Loggt Datenbankfehler abhängig von der Konfiguration
+     *
+     * @param string $error Fehlermeldung
+     * @param string $query SQL-Abfrage, die den Fehler verursacht hat
+     */
+    /**
+     * Loggt Datenbankfehler abhängig von der Konfiguration
+     *
+     * @param string $error Fehlermeldung
+     * @param string $query SQL-Abfrage, die den Fehler verursacht hat
+     */
+    private function log_db_errors(string $error, string $query): void
+    {
+        $message = '<p>Fehler am ' . date('Y-m-d H:i:s') . ':</p>';
+        $message .= '<p>Abfrage: ' . htmlspecialchars($query, ENT_QUOTES, 'UTF-8') . '<br />';
+        $message .= 'Fehler: ' . $error;
+        $message .= '</p>';
+
+        // Log immer in die Fehlerprotokolldatei
+        error_log("Datenbankfehler: " . strip_tags($message));
+
+        // E-Mail senden, wenn konfiguriert
+        if (defined('SEND_ERRORS_TO')) {
+            // Sichere E-Mail-Generierung ohne Header-Injection-Risiko
+            $to = filter_var(SEND_ERRORS_TO, FILTER_SANITIZE_EMAIL);
+            $subject = 'Datenbankfehler';
+
+            // Sichere Header-Erstellung
+            $headers = [
+                'MIME-Version: 1.0',
+                'Content-type: text/html; charset=UTF-8',
+                'To: Admin <' . $to . '>'
+            ];
+
+            // Domain validieren und für From-Header verwenden
+            $domain = isset($_SERVER['HTTP_HOST']) ? $_SERVER['HTTP_HOST'] : 'localhost';
+            if (preg_match('/^[a-z0-9.-]+$/i', $domain)) {
+                $headers[] = 'From: System <system@' . $domain . '>';
+            } else {
+                $headers[] = 'From: System <system@example.com>';
+            }
+
+            // Sicherer E-Mail-Versand
+            mail($to, $subject, $message, implode("\r\n", $headers));
+        }
+
+        // Debug-Ausgabe nur in Entwicklungsumgebungen
+        if (defined('DISPLAY_DEBUG') && DISPLAY_DEBUG &&
+            (defined('DEVELOPMENT_ENVIRONMENT') && DEVELOPMENT_ENVIRONMENT)) {
+            echo $message;
+        }
+    }
+
+    /**
+     * Bereinigt Daten für die sichere Verwendung in Datenbankabfragen
+     *
+     * @param mixed $data Zu bereinigende Daten (Zeichenkette oder Array)
+     * @return mixed Bereinigte Daten
+     */
+    public function escape_db(mixed $data): mixed
     {
         if (!is_array($data)) {
-            $data = $this->link->real_escape_string($data);
-            $data = trim(htmlentities($data, ENT_QUOTES, 'UTF-8', false));
+            return $this->link->real_escape_string((string)$data);
         } else {
-            //Self call function to sanitize array data
-            $data = array_map(array($this, 'filter'), $data);
+            return array_map([$this, 'escape_db'], $data);
+        }
+    }
+
+    /**
+     * Bereinigt Daten für die sichere Ausgabe in HTML
+     *
+     * @param mixed $data Zu bereinigende Daten (Zeichenkette oder Array)
+     * @return mixed Bereinigte Daten
+     */
+    public function escape_html(mixed $data): mixed
+    {
+        if (!is_array($data)) {
+            return htmlspecialchars((string)$data, ENT_QUOTES, 'UTF-8');
+        } else {
+            return array_map([$this, 'escape_html'], $data);
+        }
+    }
+
+    /**
+     * Legacy-Methode für die Kompatibilität, verwendet nun escape_db und escape_html getrennt
+     *
+     * @deprecated Verwende stattdessen escape_db oder escape_html
+     * @param mixed $data Zu bereinigende Daten
+     * @return mixed Bereinigte Daten
+     */
+    public function filter(mixed $data): mixed
+    {
+        if (!is_array($data)) {
+            $data = $this->escape_db($data);
+            $data = trim($this->escape_html($data));
+        } else {
+            $data = array_map([$this, 'filter'], $data);
         }
         return $data;
     }
 
-
-
-    public function escape($data):mixed
+    /**
+     * Legacy-Methode für Escape-Funktion
+     *
+     * @deprecated Verwende stattdessen escape_db
+     * @param mixed $data Zu bereinigende Daten
+     * @return mixed Bereinigte Daten
+     */
+    public function escape(mixed $data): mixed
     {
-        if (!is_array($data)) {
-            $data = $this->link->real_escape_string($data);
-        } else {
-            //Self call function to sanitize array data
-            $data = array_map(array($this, 'escape'), $data);
-        }
-        return $data;
+        return $this->escape_db($data);
     }
 
-
-    public function clean($data):string
+    /**
+     * Dekodiert HTML-Entitäten und Sonderzeichen für die Ausgabe
+     * ACHTUNG: Nur für vertrauenswürdige Daten verwenden, die bereits gesäubert wurden!
+     * Diese Methode entfernt Sicherheitsmaßnahmen und sollte mit Vorsicht verwendet werden.
+     *
+     * @param string $data Zu dekodierende Zeichenkette
+     * @return string Dekodierte Zeichenkette
+     */
+    public function clean(string $data): string
     {
-        $data = stripslashes($data);
         $data = html_entity_decode($data, ENT_QUOTES, 'UTF-8');
         $data = nl2br($data);
-        $data = urldecode($data);
         return $data;
     }
 
 
-
-    public function db_common($value = ''):bool
+    /**
+     * Prüft, ob ein Wert bestimmte MySQL-Funktionen enthält
+     * Diese Methode sollte NICHT mehr für direkte SQL-Einbettung verwendet werden
+     *
+     * @param mixed $value Zu prüfender Wert
+     * @return bool True, wenn der Wert MySQL-Funktionen enthält
+     * @deprecated Verwende stattdessen immer Prepared Statements
+     */
+    private function db_common(mixed $value = ''): bool
     {
         if (is_array($value)) {
             foreach ($value as $v) {
-                if (preg_match('/AES_DECRYPT/i', $v) || preg_match('/AES_ENCRYPT/i', $v) || preg_match('/now()/i', $v)) {
+                if (preg_match('/AES_DECRYPT|AES_ENCRYPT|now\(\)/i', $v)) {
                     return true;
-                } else {
-                    return false;
                 }
             }
-        } else {
-            if (preg_match('/AES_DECRYPT/i', $value) || preg_match('/AES_ENCRYPT/i', $value) || preg_match('/now()/i', $value)) {
-                return true;
-            }
-        }
-    }
-
-
-
-    public function query(string $query,int $resultmode = NULL):bool
-    {
-        $full_query = $this->link->query($query);
-        if ($this->link->error) {
-            $this->log_db_errors($this->link->error, $query);
             return false;
         } else {
-            return true;
+            return preg_match('/AES_DECRYPT|AES_ENCRYPT|now\(\)/i', (string)$value);
         }
     }
 
-
-
-    public function table_exists($name)
+    /**
+     * Führt eine SQL-Abfrage aus (Kompatibilität mit mysqli)
+     *
+     * @param string $query SQL-Abfrage
+     * @param int $resultmode Ergebnismodus (optional)
+     * @return mysqli_result|bool Ergebnis der Abfrage oder false bei Fehler
+     * @throws QueryException Wenn die Abfrage fehlschlägt
+     */
+    public function query(string $query, int $resultmode = MYSQLI_STORE_RESULT): mysqli_result|bool
     {
         self::$counter++;
-        $check = $this->link->query("SELECT 1 FROM $name");
-        if ($check !== false) {
-            if ($check->num_rows > 0) {
-                return true;
-            } else {
-                return false;
+
+        $result = $this->link->query($query, $resultmode);
+
+        if ($this->link->error) {
+            $this->log_db_errors($this->link->error, $query);
+            throw new QueryException("Abfragefehler: " . $this->link->error);
+        }
+
+        return $result;
+    }
+
+    /**
+     * Führt eine SQL-Abfrage mit Prepared Statements aus
+     *
+     * @param string $query SQL-Abfrage
+     * @param array $params Parameter für die Abfrage (optional)
+     * @param string $types Typen der Parameter (optional)
+     * @return mysqli_result|bool Ergebnis der Abfrage
+     * @throws QueryException Wenn die Abfrage fehlschlägt
+     */
+    /**
+     * Führt eine SQL-Abfrage mit Prepared Statements aus
+     * mit verbesserter Typenbehandlung
+     *
+     * @param string $query SQL-Abfrage
+     * @param array $params Parameter für die Abfrage (optional)
+     * @param string $types Typen der Parameter (optional)
+     * @return mysqli_result|bool Ergebnis der Abfrage
+     * @throws QueryException Wenn die Abfrage fehlschlägt
+     */
+    public function prepare_query(string $query, array $params = [], string $types = ''): mysqli_result|bool
+    {
+        self::$counter++;
+
+        if (empty($params)) {
+            // Direkte Abfrage ohne Parameter
+            return $this->query($query);
+        }
+
+        // Prepared Statement mit Parametern
+        $stmt = $this->link->prepare($query);
+
+        if (!$stmt) {
+            $this->log_db_errors($this->link->error, $query);
+            throw new QueryException("Fehler beim Vorbereiten der Abfrage: " . $this->link->error);
+        }
+
+        // Verbesserte Typenbehandlung
+        if (empty($types)) {
+            // Automatische Typerkennung
+            $types = '';
+            foreach ($params as $param) {
+                if (is_int($param)) {
+                    $types .= 'i'; // Integer
+                } elseif (is_float($param)) {
+                    $types .= 'd'; // Double
+                } elseif (is_string($param)) {
+                    $types .= 's'; // String
+                } elseif (is_null($param)) {
+                    $types .= 's'; // NULL als String behandeln
+                } else {
+                    $types .= 's'; // Standardmäßig als String behandeln
+                }
             }
-        } else {
+        }
+
+        // Parameter binden
+        if (count($params) > 0) {
+            $stmt->bind_param($types, ...$params);
+        }
+
+        // Abfrage ausführen
+        $success = $stmt->execute();
+
+        if (!$success) {
+            $this->log_db_errors($stmt->error, $query);
+            $stmt->close();
+            throw new QueryException("Fehler beim Ausführen der Abfrage: " . $stmt->error);
+        }
+
+        $result = $stmt->get_result();
+        $stmt->close();
+
+        return $result ?: true;
+    }
+
+    /**
+     * Prüft, ob eine Tabelle existiert
+     *
+     * @param string $table Name der Tabelle
+     * @return bool True, wenn die Tabelle existiert
+     * @throws QueryException Bei Abfragefehlern
+     */
+    public function table_exists(string $table): bool
+    {
+        self::$counter++;
+
+        // Validiere den Tabellennamen
+        if (!$this->validate_table_name($table)) {
+            throw new QueryException("Ungültiger Tabellenname: " . $table);
+        }
+
+        try {
+            // Korrekte Verwendung von prepare_query statt query mit Parametern
+            $result = $this->prepare_query("SHOW TABLES LIKE ?", [$table]);
+            return $result instanceof mysqli_result && $result->num_rows > 0;
+        } catch (QueryException $e) {
             return false;
         }
     }
 
-
-
-    public function num_rows($query):int
+    /**
+     * Gibt die Anzahl der Zeilen zurück, die einer Abfrage entsprechen
+     *
+     * @param string $query SQL-Abfrage
+     * @param array $params Parameter für die Abfrage (optional)
+     * @return int Anzahl der Zeilen
+     * @throws QueryException Bei Abfragefehlern
+     */
+    public function num_rows(string $query, array $params = []): int
     {
         self::$counter++;
-        $num_rows = $this->link->query($query);
-        if ($this->link->error) {
-            $this->log_db_errors($this->link->error, $query);
-            return $this->link->error;
-        } else {
-            return $num_rows->num_rows;
+
+        $result = empty($params) ? $this->query($query) : $this->prepare_query($query, $params);
+
+        if ($result instanceof mysqli_result) {
+            return $result->num_rows;
         }
+
+        return 0;
     }
 
-
-    public function exists($table = '', $check_val = '', $params = array())
+    /**
+     * Prüft, ob ein Eintrag in einer Tabelle existiert
+     *
+     * @param string $table Tabellenname
+     * @param string $check_val Zu prüfendes Feld
+     * @param array $params Parameter für die WHERE-Klausel
+     * @return bool True, wenn der Eintrag existiert
+     * @throws QueryException Bei Abfragefehlern
+     */
+    public function exists(string $table, string $check_val, array $params = []): bool
     {
         self::$counter++;
+
         if (empty($table) || empty($check_val) || empty($params)) {
             return false;
         }
-        $check = array();
+
+        // Tabellennamen validieren
+        if (!$this->validate_table_name($table)) {
+            throw new QueryException("Ungültiger Tabellenname: " . $table);
+        }
+
+        // Check_val validieren
+        if (!preg_match('/^[a-zA-Z0-9_*]+$/', $check_val)) {
+            throw new QueryException("Ungültiger Feldname: " . $check_val);
+        }
+
+        $where_clauses = [];
+        $query_params = [];
+
         foreach ($params as $field => $value) {
-            if (!empty($field) && !empty($value)) {
-                //Check for frequently used mysql commands and prevent encapsulation of them
-                if ($this->db_common($value)) {
-                    $check[] = "$field = $value";
-                } else {
-                    $check[] = "$field = '$value'";
-                }
+            if (!preg_match('/^[a-zA-Z0-9_]+$/', $field)) {
+                throw new QueryException("Ungültiger Feldname: " . $field);
+            }
+
+            // Immer Prepared Statements verwenden
+            $where_clauses[] = "`$field` = ?";
+            $query_params[] = $value;
+        }
+
+        $where = implode(' AND ', $where_clauses);
+        $query = "SELECT `$check_val` FROM `$table` WHERE $where LIMIT 1";
+
+        $result = $this->prepare_query($query, $query_params);
+
+        return $result instanceof mysqli_result && $result->num_rows > 0;
+    }
+
+
+
+    /**
+     * Gibt eine einzelne Zeile aus der Datenbank zurück
+     *
+     * @param string $query SQL-Abfrage
+     * @param array $params Parameter für die Abfrage (optional)
+     * @param bool $object Gibt ein Objekt zurück, wenn true, sonst ein Array
+     * @return array|object|null Datenbankeintrag
+     * @throws QueryException Bei Abfragefehlern
+     */
+    public function get_row(string $query, array $params = [], bool $object = false): array|object|null
+    {
+        self::$counter++;
+
+        $result = empty($params) ? $this->query($query) : $this->prepare_query($query, $params);
+
+        if (!$result instanceof mysqli_result) {
+            throw new QueryException("Ungültiges Abfrageergebnis");
+        }
+
+        if ($result->num_rows === 0) {
+            return null;
+        }
+
+        return $object ? $result->fetch_object() : $result->fetch_assoc();
+    }
+
+    /**
+     * Gibt mehrere Zeilen aus der Datenbank zurück
+     *
+     * @param string $query SQL-Abfrage
+     * @param array $params Parameter für die Abfrage (optional)
+     * @param bool $object Gibt Objekte zurück, wenn true, sonst Arrays
+     * @return array|null Array von Datenbankeinträgen
+     * @throws QueryException Bei Abfragefehlern
+     */
+    public function get_results(string $query, array $params = [], bool $object = false): ?array
+    {
+        self::$counter++;
+
+        $result = empty($params) ? $this->query($query) : $this->prepare_query($query, $params);
+
+        if (!$result instanceof mysqli_result) {
+            throw new QueryException("Ungültiges Abfrageergebnis");
+        }
+
+        if ($result->num_rows === 0) {
+            return null;
+        }
+
+        $rows = [];
+
+        if ($object) {
+            while ($row = $result->fetch_object()) {
+                $rows[] = $row;
+            }
+        } else {
+            while ($row = $result->fetch_assoc()) {
+                $rows[] = $row;
             }
         }
-        $check = implode(' AND ', $check);
-        $rs_check = "SELECT $check_val FROM " . $table . " WHERE $check";
-        $number = $this->num_rows($rs_check);
-        if ($number === 0) {
-            return false;
-        } else {
-            return true;
-        }
+
+        return $rows;
     }
 
-
-    public function get_row($query, $object = false)
+    /**
+     * Fügt einen Datensatz in die Datenbank ein
+     *
+     * @param string $table Tabellenname
+     * @param array $variables Einzufügende Daten
+     * @return bool True bei Erfolg
+     * @throws QueryException Bei Abfragefehlern
+     */
+    public function insert(string $table, array $variables = []): bool
     {
         self::$counter++;
-        $row = $this->link->query($query);
-        if ($this->link->error) {
-            $this->log_db_errors($this->link->error, $query);
-            return false;
-        } else {
-            $r = (!$object) ? $row->fetch_row() : $row->fetch_object();
-            return $r;
+
+        if (empty($variables)) {
+            throw new QueryException("Keine Daten zum Einfügen angegeben");
         }
-    }
 
-
-
-    public function get_results($query, $object = false)
-    {
-        self::$counter++;
-        //Overwrite the $row var to null
-        $row = null;
-
-        $results = $this->link->query($query);
-        if ($results->num_rows == 0) {
-            return $row;
+        // Tabellennamen validieren
+        if (!preg_match('/^[a-zA-Z0-9_]+$/', $table)) {
+            throw new QueryException("Ungültiger Tabellenname: " . $table);
         }
-        if ($this->link->error) {
-            $this->log_db_errors($this->link->error, $query);
-            return false;
-        } else {
-            $row = array();
-            while ($r = (!$object) ? $results->fetch_assoc() : $results->fetch_object()) {
-                $row[] = $r;
+
+        $fields = [];
+        $placeholders = [];
+        $values = [];
+
+        foreach ($variables as $field => $value) {
+            if (!preg_match('/^[a-zA-Z0-9_]+$/', $field)) {
+                throw new QueryException("Ungültiger Feldname: " . $field);
             }
-            return $row;
+
+            $fields[] = "`$field`";
+            $placeholders[] = "?";
+            $values[] = $value;
         }
+
+        $fields_str = implode(', ', $fields);
+        $placeholders_str = implode(', ', $placeholders);
+
+        $query = "INSERT INTO `$table` ($fields_str) VALUES ($placeholders_str)";
+
+        $this->query($query, $values);
+
+        return true;
     }
 
-
-    public function insert($table, $variables = array())
+    /**
+     * Fügt mehrere Datensätze in die Datenbank ein
+     *
+     * @param string $table Tabellenname
+     * @param array $columns Spaltennamen
+     * @param array $records Einzufügende Datensätze
+     * @return int Anzahl der eingefügten Datensätze
+     * @throws QueryException Bei Abfragefehlern
+     */
+    public function insert_multi(string $table, array $columns = [], array $records = []): int
     {
         self::$counter++;
-        //Make sure the array isn't empty
-        if (empty($variables)) {
-            return false;
-        }
 
-        $sql = "INSERT INTO " . $table;
-        $fields = array();
-        $values = array();
-        foreach ($variables as $field => $value) {
-            $fields[] = $field;
-            $values[] = "'" . $value . "'";
-        }
-        $fields = ' (' . implode(', ', $fields) . ')';
-        $values = '(' . implode(', ', $values) . ')';
-
-        $sql .= $fields . ' VALUES ' . $values;
-        $query = $this->link->query($sql);
-
-        if ($this->link->error) {
-            //return false; 
-            $this->log_db_errors($this->link->error, $sql);
-            return false;
-        } else {
-            return true;
-        }
-    }
-
-
-    public function insert_safe($table, $variables = array())
-    {
-        self::$counter++;
-        //Make sure the array isn't empty
-        if (empty($variables)) {
-            return false;
-        }
-
-        $sql = "INSERT INTO " . $table;
-        $fields = array();
-        $values = array();
-        foreach ($variables as $field => $value) {
-            $fields[] = $this->filter($field);
-            //Check for frequently used mysql commands and prevent encapsulation of them
-            $values[] = "'" . $value . "'";
-        }
-        $fields = ' (' . implode(', ', $fields) . ')';
-        $values = '(' . implode(', ', $values) . ')';
-
-        $sql .= $fields . ' VALUES ' . $values;
-        $query = $this->link->query($sql);
-
-        if ($this->link->error) {
-            $this->log_db_errors($this->link->error, $sql);
-            return false;
-        } else {
-            return true;
-        }
-    }
-
-
-
-    public function insert_multi($table, $columns = array(), $records = array())
-    {
-        self::$counter++;
-        //Make sure the arrays aren't empty
         if (empty($columns) || empty($records)) {
-            return false;
+            throw new QueryException("Keine Spalten oder Datensätze zum Einfügen angegeben");
         }
-        //Count the number of fields to ensure insertion statements do not exceed the same num
+
+        // Tabellennamen validieren
+        if (!$this->validate_table_name($table)) {
+            throw new QueryException("Ungültiger Tabellenname: " . $table);
+        }
+
+        // Spaltennamen validieren
+        $fields = [];
+        foreach ($columns as $column) {
+            if (!preg_match('/^[a-zA-Z0-9_]+$/', $column)) {
+                throw new QueryException("Ungültiger Spaltenname: " . $column);
+            }
+            $fields[] = "`$column`";
+        }
+
+        $fields_str = implode(', ', $fields);
         $number_columns = count($columns);
-        //Start a counter for the rows
-        $added = 0;
-        //Start the query
-        $sql = "INSERT INTO " . $table;
-        $fields = array();
-        //Loop through the columns for insertion preparation
-        foreach ($columns as $field) {
-            $fields[] = '`' . $field . '`';
-        }
-        $fields = ' (' . implode(', ', $fields) . ')';
-        //Loop through the records to insert
-        $values = array();
+
+        // Multi-insert mit Prepared Statement
+        $placeholders = rtrim(str_repeat('?,', $number_columns), ',');
+        $records_placeholder = rtrim(str_repeat("($placeholders),", count($records)), ',');
+
+        $query = "INSERT INTO `$table` ($fields_str) VALUES $records_placeholder";
+
+        // Parameter flach machen
+        $params = [];
         foreach ($records as $record) {
-            //Only add a record if the values match the number of columns
-            if (count($record) == $number_columns) {
-                $values[] = '(\'' . implode('\', \'', array_values($record)) . '\')';
-                $added++;
+            if (count($record) != $number_columns) {
+                continue;
+            }
+            foreach ($record as $value) {
+                $params[] = $value;
             }
         }
-        $values = implode(', ', $values);
-        $sql .= $fields . ' VALUES ' . $values;
-        $query = $this->link->query($sql);
-        if ($this->link->error) {
-            $this->log_db_errors($this->link->error, $sql);
-            return false;
-        } else {
-            return $added;
-        }
+
+        $this->query($query, $params);
+
+        return count($records);
     }
 
-
-    public function update($table, $variables = array(), $where = array(), $freewhere = '', $limit = '')
+    /**
+     * Aktualisiert Datensätze in der Datenbank
+     *
+     * @param string $table Tabellenname
+     * @param array $variables Zu aktualisierende Daten
+     * @param array $where WHERE-Bedingungen
+     * @param string $limit Limit (optional)
+     * @return bool True bei Erfolg
+     * @throws QueryException Bei Abfragefehlern
+     */
+    public function update(string $table, array $variables = [], array $where = [], string $limit = ''): bool
     {
         self::$counter++;
+
         if (empty($variables)) {
-            return false;
+            throw new QueryException("Keine Daten zum Aktualisieren angegeben");
         }
-        $sql = "UPDATE " . $table . " SET ";
+
+        // Tabellennamen validieren
+        if (!preg_match('/^[a-zA-Z0-9_]+$/', $table)) {
+            throw new QueryException("Ungültiger Tabellenname: " . $table);
+        }
+
+        $updates = [];
+        $params = [];
+
         foreach ($variables as $field => $value) {
-
-            $updates[] = "`$field` = '$value'";
-        }
-        $sql .= implode(', ', $updates);
-
-        //Add the $where clauses as needed
-        if (!empty($where)) {
-            foreach ($where as $field => $value) {
-                $value = $value;
-                $clause[] = "$field = '$value'";
+            if (!preg_match('/^[a-zA-Z0-9_]+$/', $field)) {
+                throw new QueryException("Ungültiger Feldname: " . $field);
             }
-            $sql .= ' WHERE ' . implode(' AND ', $clause);
-        }
-        if ($freewhere <> '') {
-            $sql .= 'AND ' . $freewhere;
-        }
-        if (!empty($limit)) {
-            $sql .= ' LIMIT ' . $limit;
-        }
-        $query = $this->link->query($sql);
 
-        if ($this->link->error) {
-            $this->log_db_errors($this->link->error, $sql);
-            return false;
-        } else {
-            return true;
+            $updates[] = "`$field` = ?";
+            $params[] = $value;
         }
+
+        $where_clauses = [];
+
+        foreach ($where as $field => $value) {
+            if (!preg_match('/^[a-zA-Z0-9_]+$/', $field)) {
+                throw new QueryException("Ungültiger Feldname in WHERE-Klausel: " . $field);
+            }
+
+            $where_clauses[] = "`$field` = ?";
+            $params[] = $value;
+        }
+
+        $query = "UPDATE `$table` SET " . implode(', ', $updates);
+
+        if (!empty($where_clauses)) {
+            $query .= " WHERE " . implode(' AND ', $where_clauses);
+        }
+
+        if (!empty($limit)) {
+            // Limit validieren
+            if (!preg_match('/^\d+$/', $limit)) {
+                throw new QueryException("Ungültiges Limit: " . $limit);
+            }
+            $query .= " LIMIT $limit";
+        }
+
+        $this->query($query, $params);
+
+        return true;
     }
 
+    /**
+     * Validiert einen Tabellennamen und unterstützt auch Schema-Präfixe
+     *
+     * @param string $table Zu validierender Tabellenname
+     * @return bool True, wenn der Tabellenname gültig ist
+     */
+    private function validate_table_name(string $table): bool
+    {
+        // Erlaubt Schema.Tabelle Format sowie Bindestriche in Tabellennamen
+        return preg_match('/^([a-zA-Z0-9_-]+\.)?[a-zA-Z0-9_-]+$/', $table);
+    }
 
-
-
-
-
-    public function delete($table, $where = array(), $limit = ''):bool
+    /**
+     * Löscht Datensätze aus der Datenbank
+     *
+     * @param string $table Tabellenname
+     * @param array $where WHERE-Bedingungen
+     * @param string $limit Limit (optional)
+     * @return bool True bei Erfolg
+     * @throws QueryException Bei Abfragefehlern
+     */
+    public function delete(string $table, array $where = [], string $limit = ''): bool
     {
         self::$counter++;
-        //Delete clauses require a where param, otherwise use "truncate"
+
         if (empty($where)) {
-            return false;
+            throw new QueryException("Keine WHERE-Bedingungen zum Löschen angegeben");
         }
 
-        $sql = "DELETE FROM " . $table;
-       foreach ($where as $field => $value) {
-           $clause[] = "$field = '$value'";
+        // Verbesserte Tabellennamen-Validierung
+        if (!$this->validate_table_name($table)) {
+            throw new QueryException("Ungültiger Tabellenname: " . $table);
         }
-        $sql .= " WHERE " . implode(' AND ', $clause);
+
+        $where_clauses = [];
+        $params = [];
+
+        foreach ($where as $field => $value) {
+            if (!preg_match('/^[a-zA-Z0-9_]+$/', $field)) {
+                throw new QueryException("Ungültiger Feldname in WHERE-Klausel: " . $field);
+            }
+
+            $where_clauses[] = "`$field` = ?";
+            $params[] = $value;
+        }
+
+        $query = "DELETE FROM `$table` WHERE " . implode(' AND ', $where_clauses);
 
         if (!empty($limit)) {
-            $sql .= " LIMIT " . $limit;
+            // Limit validieren
+            if (!preg_match('/^\d+$/', $limit)) {
+                throw new QueryException("Ungültiges Limit: " . $limit);
+            }
+            $query .= " LIMIT $limit";
         }
-        echo $sql;
-        $query = $this->link->query($sql);
-        if ($this->link->error) {
-            //return false; //
-            $this->log_db_errors($this->link->error, $sql);
-            return false;
-        } else {
-            return true;
-        }
+
+        $this->query($query, $params);
+
+        return true;
     }
 
-
-    public function lastid()
+    /**
+     * Gibt die ID des zuletzt eingefügten Datensatzes zurück
+     *
+     * @return int ID des zuletzt eingefügten Datensatzes
+     */
+    public function lastid(): int
     {
         self::$counter++;
         return $this->link->insert_id;
     }
 
-
-    public function affected()
+    /**
+     * Gibt die Anzahl der betroffenen Zeilen zurück
+     *
+     * @return int Anzahl der betroffenen Zeilen
+     */
+    public function affected(): int
     {
         return $this->link->affected_rows;
     }
 
-
-
-    public function num_fields($query)
+    /**
+     * Gibt die Anzahl der Felder in einer Abfrage zurück
+     *
+     * @param string $query SQL-Abfrage
+     * @param array $params Parameter für die Abfrage (optional)
+     * @return int Anzahl der Felder
+     * @throws QueryException Bei Abfragefehlern
+     */
+    public function num_fields(string $query, array $params = []): int
     {
         self::$counter++;
-        $query = $this->link->query($query);
-        $fields = $query->field_count;
-        return $fields;
-    }
 
+        $result = $this->query($query, $params);
 
-    public function list_fields($query)
-    {
-        self::$counter++;
-        $query = $this->link->query($query);
-        $listed_fields = $query->fetch_fields();
-        return $listed_fields;
-    }
-
-
-    public function truncate($tables = array())
-    {
-        if (!empty($tables)) {
-            $truncated = 0;
-            foreach ($tables as $table) {
-                $truncate = "TRUNCATE TABLE `" . trim($table) . "`";
-                $this->link->query($truncate);
-                if (!$this->link->error) {
-                    $truncated++;
-                    self::$counter++;
-                }
-            }
-            return $truncated;
+        if (!$result instanceof mysqli_result) {
+            throw new QueryException("Ungültiges Abfrageergebnis");
         }
+
+        return $result->field_count;
     }
 
-    public function display($variable, $echo = true)
+    /**
+     * Gibt eine Liste der Felder in einer Abfrage zurück
+     *
+     * @param string $query SQL-Abfrage
+     * @param array $params Parameter für die Abfrage (optional)
+     * @return array Liste der Felder
+     * @throws QueryException Bei Abfragefehlern
+     */
+    public function list_fields(string $query, array $params = []): array
+    {
+        self::$counter++;
+
+        $result = $this->query($query, $params);
+
+        if (!$result instanceof mysqli_result) {
+            throw new QueryException("Ungültiges Abfrageergebnis");
+        }
+
+        return $result->fetch_fields();
+    }
+
+    /**
+     * Leert mehrere Tabellen
+     *
+     * @param array $tables Liste der zu leerenden Tabellen
+     * @return int Anzahl der geleerten Tabellen
+     * @throws QueryException Bei Abfragefehlern
+     */
+    public function truncate(array $tables = []): int
+    {
+        if (empty($tables)) {
+            return 0;
+        }
+
+        $truncated = 0;
+
+        foreach ($tables as $table) {
+            // Tabellennamen validieren
+            if (!preg_match('/^[a-zA-Z0-9_]+$/', $table)) {
+                throw new QueryException("Ungültiger Tabellenname: " . $table);
+            }
+
+            $truncate = "TRUNCATE TABLE `" . trim($table) . "`";
+            $this->query($truncate);
+            $truncated++;
+            self::$counter++;
+        }
+
+        return $truncated;
+    }
+
+    /**
+     * Zeigt eine Variable an oder gibt sie zurück
+     *
+     * @param mixed $variable Anzuzeigende Variable
+     * @param bool $echo Gibt die Variable aus, wenn true, sonst wird sie zurückgegeben
+     * @return string|void Formatierte Variable, wenn $echo false ist
+     */
+    public function display(mixed $variable, bool $echo = true): ?string
     {
         $out = '';
+
         if (!is_array($variable)) {
-            $out .= $variable;
+            $out .= htmlspecialchars((string)$variable, ENT_QUOTES, 'UTF-8');
         } else {
             $out .= '<pre>';
-            $out .= print_r($variable, TRUE);
+            $out .= htmlspecialchars(print_r($variable, true), ENT_QUOTES, 'UTF-8');
             $out .= '</pre>';
         }
-        if ($echo === true) {
+
+        if ($echo) {
             echo $out;
+            return null;
         } else {
             return $out;
         }
     }
 
-
-    public function total_queries()
+    /**
+     * Gibt die Gesamtzahl der ausgeführten Abfragen zurück
+     *
+     * @return int Anzahl der Abfragen
+     */
+    public function total_queries(): int
     {
         return self::$counter;
     }
 
-
-    static function getInstance()
+    /**
+     * Gibt eine Singleton-Instanz der Datenbankklasse zurück
+     *
+     * @return Database Instanz der Datenbankklasse
+     * @throws ConnectionException Wenn keine Instanz vorhanden ist
+     */
+    public static function getInstance(): Database
     {
-        if (self::$inst == null) {
-            self::$inst = new DB();
+        if (self::$instance === null) {
+            throw new ConnectionException("Es wurde keine Datenbankinstanz erstellt");
         }
-        return self::$inst;
+
+        return self::$instance;
     }
 
+    /**
+     * Erstellt eine Singleton-Instanz der Datenbankklasse
+     *
+     * @param string $DB_HOST Hostname des Datenbankservers
+     * @param string $DB_USER Benutzername für die Datenbankverbindung
+     * @param string $DB_PASS Passwort für die Datenbankverbindung
+     * @param string $DB_NAME Name der Datenbank
+     * @return Database Instanz der Datenbankklasse
+     */
+    public static function createInstance(string $DB_HOST, string $DB_USER, string $DB_PASS, string $DB_NAME): Database
+    {
+        if (self::$instance === null) {
+            self::$instance = new Database($DB_HOST, $DB_USER, $DB_PASS, $DB_NAME);
+        }
 
+        return self::$instance;
+    }
 
-    public function disconnect()
+    /**
+     * Schließt die Datenbankverbindung
+     */
+    public function disconnect(): void
     {
         $this->link->close();
     }
 }
-    
-
