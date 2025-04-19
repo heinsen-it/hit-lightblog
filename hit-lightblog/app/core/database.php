@@ -5,13 +5,10 @@ use Exception;
 use mysqli;
 use mysqli_stmt;
 use mysqli_result;
+use hitlightblog\app\exception\DatabaseException;
+use hitlightblog\app\exception\QueryException;
+use hitlightblog\app\exception\ConnectionException;
 
-/**
- * Benutzerdefinierte Exception-Klassen für besseres Exception-Handling
- */
-class DatabaseException extends Exception {}
-class QueryException extends DatabaseException {}
-class ConnectionException extends DatabaseException {}
 
 /**
  * Verbesserte Datenbankklasse mit Sicherheitsverbesserungen und Typensicherheit
